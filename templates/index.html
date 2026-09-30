@@ -42,7 +42,7 @@
             overflow-x: hidden;
         }
 
-        /* Cyberpunk Ambient Lighting */
+        /* Ambient Lighting */
         .ambient-glow {
             position: fixed;
             width: 500px;
@@ -525,10 +525,10 @@
         <header>
             <div class="badge">
                 <span class="badge-dot"></span>
-                Latent Diffusion Model
+                Hugging Face Inference Providers
             </div>
             <h1>Text-to-Image <span class="gradient-span">Generative AI</span></h1>
-            <p class="subtitle">Transform descriptive prompts into high-quality digital artwork powered by RunwayML Stable Diffusion v1-5.</p>
+            <p class="subtitle">Transform descriptive prompts into high-quality digital artwork powered by Hugging Face Inference Providers.</p>
         </header>
 
         <!-- Main Workspace -->
@@ -539,7 +539,7 @@
                     <div class="form-section">
                         <div class="section-label">
                             <span>Prompt Description</span>
-                            <span class="model-tag">SD v1.5 • 20 steps</span>
+                            <span class="model-tag">FLUX.1-schnell • HF Inference</span>
                         </div>
 
                         <textarea 
@@ -611,8 +611,8 @@
                     <!-- Loading / Progress Overlay -->
                     <div id="loadingOverlay" class="loading-overlay">
                         <div class="cyber-spinner"></div>
-                        <div class="loading-title">Synthesizing Diffusion Steps</div>
-                        <div class="loading-sub">Denoising latent representations... Image generation takes ~1-3 min on CPU.</div>
+                        <div class="loading-title">Synthesizing Artwork</div>
+                        <div class="loading-sub">Generating image via Hugging Face Inference Providers...</div>
                         <div id="elapsedTimer" class="loading-timer">00:00</div>
                     </div>
                 </div>
@@ -638,7 +638,7 @@
 
         <!-- Footer -->
         <footer>
-            <p>Text-to-Image Generative AI • Powered by Stable Diffusion v1.5 & PyTorch • Flask Server</p>
+            <p>Text-to-Image Generative AI • Powered by Hugging Face Inference Providers • Flask Server</p>
         </footer>
     </div>
 
@@ -683,7 +683,7 @@
             }
         }
 
-        // Handle AJAX form submission for smooth UI experience without page refresh
+        // Handle AJAX form submission with robust non-JSON protection
         form.addEventListener('submit', async function (e) {
             e.preventDefault();
 
@@ -713,10 +713,27 @@
                     body: JSON.stringify({ prompt: promptValue })
                 });
 
-                const data = await response.json();
+                let data = null;
+                const contentType = response.headers.get("content-type") || "";
 
-                if (!response.ok || data.error) {
-                    throw new Error(data.error || `Server error (${response.status})`);
+                // Safely parse JSON if returned
+                if (contentType.includes("application/json")) {
+                    data = await response.json();
+                } else {
+                    // Handle non-JSON responses (e.g. Render HTML 502/504 error pages)
+                    const textResponse = await response.text();
+                    if (!response.ok) {
+                        throw new Error(`Server error (${response.status}): ${response.statusText || 'Unexpected server error'}`);
+                    }
+                }
+
+                if (!response.ok || (data && data.error)) {
+                    const errorMsg = (data && data.error) || `Server error (${response.status})`;
+                    throw new Error(errorMsg);
+                }
+
+                if (!data || !data.image) {
+                    throw new Error("No image data received from server.");
                 }
 
                 // Render image

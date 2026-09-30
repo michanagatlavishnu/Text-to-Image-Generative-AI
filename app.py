@@ -2,67 +2,25 @@ import base64
 import io
 import logging
 import os
-import threading
+import re
 from flask import Flask, jsonify, render_template, request
-import torch
-from diffusers import StableDiffusionPipeline
+from huggingface_hub import InferenceClient
+from huggingface_hub.errors import HfHubHTTPError
 
-# Configure logging
+# Configure structured logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
 # Initialize Flask application
 app = Flask(__name__)
 
-# Model configuration
-MODEL_ID = "runwayml/stable-diffusion-v1-5"
-DEFAULT_INFERENCE_STEPS = 20
-DEFAULT_GUIDANCE_SCALE = 7.5
-
-# Device configuration (CUDA GPU if available, CPU fallback)
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-TORCH_DTYPE = torch.float16 if DEVICE == "cuda" else torch.float32
-
-logger.info(f"Target execution device: {DEVICE} (torch_dtype: {TORCH_DTYPE})")
-
-# Thread-safe pipeline singleton
-_pipeline = None
-_pipeline_lock = threading.Lock()
-_pipeline_error = None
+# Model configuration for Hugging Face Inference Providers
+MODEL_ID = os.environ.get("HF_MODEL", "black-forest-labs/FLUX.1-schnell")
 
 
-def get_pipeline():
-    """Thread-safe lazy loader for StableDiffusionPipeline."""
-    global _pipeline, _pipeline_error
-
-    if _pipeline is not None:
-        return _pipeline, None
-    if _pipeline_error is not None:
-        return None, _pipeline_error
-
-    with _pipeline_lock:
-        if _pipeline is not None:
-            return _pipeline, None
-
-        logger.info(f"Loading Stable Diffusion model: {MODEL_ID} on {DEVICE}...")
-        try:
-            pipe = StableDiffusionPipeline.from_pretrained(
-                MODEL_ID,
-                torch_dtype=TORCH_DTYPE
-            )
-            pipe = pipe.to(DEVICE)
-
-            # Enable memory optimization if running on CPU or memory-constrained GPU
-            if hasattr(pipe, "enable_attention_slicing"):
-                pipe.enable_attention_slicing()
-
-            _pipeline = pipe
-            logger.info("Stable Diffusion pipeline initialized successfully.")
-            return _pipeline, None
-        except Exception as e:
-            _pipeline_error = str(e)
-            logger.error(f"Failed to initialize Stable Diffusion pipeline: {e}", exc_info=True)
-            return None, _pipeline_error
+def sanitize_error(message: str) -> str:
+    """Mask any accidental tokens or sensitive keys from error messages."""
+    return re.sub(r"hf_[a-zA-Z0-9]+", "hf_***", message)
 
 
 @app.route("/", methods=["GET"])
@@ -71,84 +29,116 @@ def index():
     return render_template("index.html")
 
 
+@app.route("/health", methods=["GET"])
+def health():
+    """Health check endpoint for Render service monitoring."""
+    hf_token_set = bool(os.environ.get("HF_TOKEN"))
+    return jsonify({
+        "status": "healthy",
+        "model": MODEL_ID,
+        "provider": "huggingface-inference-providers",
+        "token_configured": hf_token_set
+    }), 200
+
+
 @app.route("/generate", methods=["POST"])
 def generate():
     """
-    Generate an image from the provided text prompt.
-    Supports both JSON API requests and standard HTML form submissions.
+    Generate an image using Hugging Face Inference Providers.
+    Always returns valid JSON for both successful responses and errors.
     """
-    # Parse prompt from JSON body or Form data
-    is_json_request = request.is_json
-    if is_json_request:
+    # 1. Parse prompt from JSON payload or Form data
+    if request.is_json:
         data = request.get_json(silent=True) or {}
         prompt = (data.get("prompt") or "").strip()
     else:
         prompt = (request.form.get("prompt") or "").strip()
 
-    # Validate prompt input
+    # 2. Validate prompt
     if not prompt:
-        err_msg = "Please enter a descriptive prompt to generate an image."
-        if is_json_request:
-            return jsonify({"status": "error", "error": err_msg}), 400
-        return render_template("index.html", error=err_msg), 400
+        return jsonify({
+            "status": "error",
+            "error": "Please enter a descriptive prompt to generate an image."
+        }), 400
 
-    # Retrieve or initialize the Stable Diffusion model
-    pipeline, err = get_pipeline()
-    if err or pipeline is None:
-        user_err = "The AI model is currently unavailable or failed to initialize. Please try again later."
-        logger.error(f"Model retrieval error: {err}")
-        if is_json_request:
-            return jsonify({"status": "error", "error": user_err}), 503
-        return render_template("index.html", error=user_err, prompt=prompt), 503
+    # 3. Check for required Hugging Face Token
+    hf_token = os.environ.get("HF_TOKEN")
+    if not hf_token or not hf_token.strip():
+        logger.warning("Generation requested but HF_TOKEN environment variable is not set.")
+        return jsonify({
+            "status": "error",
+            "error": "Hugging Face token is not configured"
+        }), 500
 
-    # Generate image
+    # 4. Generate image using Hugging Face InferenceClient
     try:
-        logger.info(f"Generating image for prompt: '{prompt}' (device: {DEVICE}, steps: {DEFAULT_INFERENCE_STEPS})")
-        with torch.inference_mode():
-            result = pipeline(
-                prompt=prompt,
-                num_inference_steps=DEFAULT_INFERENCE_STEPS,
-                guidance_scale=DEFAULT_GUIDANCE_SCALE
-            )
-            image = result.images[0]
+        logger.info(f"Generating image with model '{MODEL_ID}' for prompt: '{prompt}'")
+        client = InferenceClient(provider="auto", token=hf_token.strip())
 
-        # Convert PIL Image to base64 Data URI in-memory
+        # Call text_to_image which returns a PIL Image
+        image = client.text_to_image(prompt=prompt, model=MODEL_ID)
+
+        # Convert PIL Image to PNG bytes and base64 Data URI
         buffered = io.BytesIO()
         image.save(buffered, format="PNG")
         img_base64 = base64.b64encode(buffered.getvalue()).decode("utf-8")
         data_uri = f"data:image/png;base64,{img_base64}"
 
-        logger.info("Image generation complete.")
+        logger.info("Image successfully generated and encoded.")
 
-        if is_json_request:
-            return jsonify({
-                "status": "success",
-                "image": data_uri,
-                "prompt": prompt
-            })
+        return jsonify({
+            "status": "success",
+            "image": data_uri,
+            "prompt": prompt
+        }), 200
 
-        return render_template("index.html", image=data_uri, prompt=prompt)
+    except HfHubHTTPError as e:
+        status_code = getattr(e.response, "status_code", 500) if hasattr(e, "response") else 500
+        logger.error(f"Hugging Face HTTP error ({status_code}): {e}")
+
+        if status_code == 401:
+            err_msg = "Invalid or unauthorized Hugging Face token. Please verify that your HF_TOKEN has Inference Providers permission."
+        elif status_code == 429:
+            err_msg = "Hugging Face rate limit or quota exceeded. Please wait a moment and try again."
+        elif status_code == 503:
+            err_msg = "The AI model is currently busy or loading on Hugging Face. Please try again shortly."
+        else:
+            err_msg = f"Image generation failed: {sanitize_error(str(e))}"
+
+        return jsonify({
+            "status": "error",
+            "error": err_msg
+        }), 502
 
     except Exception as e:
-        logger.error(f"Image generation failed: {e}", exc_info=True)
-        user_err = "An error occurred during image generation. Please try again with a different prompt."
-        if is_json_request:
-            return jsonify({"status": "error", "error": user_err}), 500
-        return render_template("index.html", error=user_err, prompt=prompt), 500
+        safe_msg = sanitize_error(str(e))
+        logger.error(f"Image generation failed with unexpected error: {safe_msg}", exc_info=True)
+        return jsonify({
+            "status": "error",
+            "error": f"Image generation failed: {safe_msg}"
+        }), 500
 
 
-@app.route("/health", methods=["GET"])
-def health():
-    """Simple health check endpoint for monitoring."""
+@app.errorhandler(404)
+def not_found_error(error):
+    """Return JSON for API 404s or fallback."""
+    if request.path == "/generate":
+        return jsonify({"status": "error", "error": "Endpoint not found"}), 404
+    return render_template("index.html"), 404
+
+
+@app.errorhandler(500)
+def internal_server_error(error):
+    """Ensure internal errors return valid JSON on API endpoints."""
+    logger.error(f"Internal server error: {error}")
     return jsonify({
-        "status": "healthy",
-        "device": DEVICE,
-        "model": MODEL_ID
-    }), 200
+        "status": "error",
+        "error": "An internal server error occurred. Please try again later."
+    }), 500
 
 
 if __name__ == "__main__":
-    # Render binds port dynamically via $PORT environment variable
+    # Render binds dynamically via $PORT environment variable
     port = int(os.environ.get("PORT", 5000))
     logger.info(f"Starting server on http://0.0.0.0:{port}")
     app.run(host="0.0.0.0", port=port)
